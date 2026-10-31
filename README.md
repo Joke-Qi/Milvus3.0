@@ -35,6 +35,7 @@
 
 传统架构通常是：
 <img width="625" height="278" alt="image" src="https://github.com/user-attachments/assets/e1a827e0-0bf4-49c9-a090-a4759adf8211" />
+
 这种模式的问题：
 
 - 数据湖保存一份原始数据。
@@ -75,4 +76,76 @@ Milvus 不需要把整份源数据复制到自身的 Collection 中，而是在�
 动作 A：将用户问题转换为向量。
 
 例如：
+例如：
+用户问题：
+帮我查找关于量子通信专线建设的相关技术资料。
 
+          ↓ Embedding 模型
+
+查询向量：
+[0.021, -0.134, 0.562, 0.087, ...]
+
+
+假设模型输出 1024 维向量。
+
+动作 B：通过 SDK 向 Milvus 发送 Search 请求。
+
+例如使用 Python SDK：
+from pymilvus import MilvusClientclient = MilvusClient(    uri="http://milvus.example.com:19530",    token="username:password")query_vector = [0.021, -0.134, 0.562, 0.087]  # 示例，实际1024维results = client.search(    collection_name="knowledge_base",    data=[query_vector],    anns_field="embedding",    search_params={        "metric_type": "COSINE",        "params": {"ef": 128}    },    limit=5,    output_fields=["title", "content", "source"])
+
+
+
+这里客户端向 Milvus 传递的核心信息包括：
+参数	作用
+collection_name	指定查询哪个 Collection
+data	待检索的查询向量
+anns_field	指定向量字段
+metric_type	指定相似度计算方式
+search_params	检索算法参数
+limit	返回 Top 5
+output_fields	希望返回哪些业务字段
+
+此时客户端并不知道向量实际存储在哪个对象存储节点、索引分布在哪些 Segment，也不需要知道。
+
+它只需要调用统一的 Milvus API。
+3. 第二步：网络接入与 Proxy 接收请求
+客户端发送请求后：
+1. SDK 将 Search 请求序列化。
+2. 通过 gRPC 或 REST 接口发送到 Milvus 服务地址。
+3. 请求经过 Kubernetes Service、Ingress、负载均衡器等接入组件。
+4. 被转发到一个可用的 Proxy 节点。
+Proxy 是 Milvus 的统一访问入口。
+
+它主要负责：
+- 身份认证与权限校验。
+- Collection 是否存在。
+- 查询字段和向量维度是否合法。
+- 检查检索参数。
+- 生成或准备查询计划。
+- 根据 Shard 路由信息，将请求分发给对应的执行节点。
+- 汇总各节点的检索结果。
+这里有一个容易混淆的地方：
+
+Proxy 不负责真正完成大规模向量相似度计算，它主要承担请求接入、路由和结果归并工作。
+4. 第三步：Coordinator 提供元数据与路由信息
+Proxy 收到请求后，需要知道：
+- 当前 Collection 有多少个 Shard？
+- 每个 Shard 分布在哪些节点？
+- Collection 对应哪些 Segment？
+- 当前有哪些索引可用？
+- 哪些 Query Node 负责相关历史数据？
+这些信息来自 Milvus 的元数据和集群协调体系。
+
+Coordinator 负责集群拓扑、任务调度、查询视图管理、Segment 分配等工作。
+
+元数据存储通常由 etcd 承担。
+
+需要注意，Coordinator 不一定在每次 Search 请求中都被直接调用。Proxy 可以使用本地缓存的路由和拓扑信息，只有缓存失效或需要更新时才向协调体系获取信息。
+Milvus Documentation+1
+
+5. 第四步：Proxy 将请求分发到检索执行节点
+这是整个检索过程最重要的环节之一。
+
+Milvus 的数据并不是简单地全部放在一台机器上，而是分布在多个 Shard 和 Segment 中。
+
+Milvus 3.x 的检索体系可以理解为两个部分：
