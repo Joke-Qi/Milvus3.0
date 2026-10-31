@@ -69,6 +69,7 @@ Milvus 不需要把整份源数据复制到自身的 Collection 中，而是在�
 
 #### 完整请求链路总览
 <img width="1014" height="1260" alt="image" src="https://github.com/user-attachments/assets/817842c5-89cb-4cf1-9ffc-0ac3d6a62555" />
+
 #### 第一步：客户端发起查询请求
 
 客户端首先完成两个动作：
@@ -154,3 +155,205 @@ Coordinator 负责集群拓扑、任务调度、查询视图管理、Segment 分
 元数据存储通常由 etcd 承担。
 
 需要注意，Coordinator 不一定在每次 Search 请求中都被直接调用。Proxy 可以使用本地缓存的路由和拓扑信息，只有缓存失效或需要更新时才向协调体系获取信息。
+
+#### 第四步：Proxy 将请求分发到检索执行节点
+
+这是整个检索过程最重要的环节之一。
+
+Milvus 的数据并不是简单地全部放在一台机器上，而是分布在多个 Shard 和 Segment 中。
+
+Milvus 3.x 的检索体系可以理解为两个部分：
+
+<img width="1036" height="226" alt="image" src="https://github.com/user-attachments/assets/cdbd8d3c-e44d-41c9-ab6e-f904b222cc42" />
+
+为什么要区分这两个节点？
+
+假设企业知识库今天刚刚新增了一份文件：
+- 文件 A：刚刚写入，还没有完成封存和索引构建。
+- 文件 B：昨天已经写入，索引构建完成。
+- 文件 C：上个月已经写入，属于历史数据。
+如果用户现在查询：
+- 文件 A 可能在 Streaming Node 的 Growing Segment 中。
+- 文件 B、C 可能在 Query Node 管理的 Sealed Segment 中。
+因此，检索请求需要兼顾实时数据和历史数据。
+
+在传统的 Milvus 3.x 分布式检索路径中，Proxy 会向相关 Shard 的 Streaming Node 并发发送请求，Streaming Node 查询本地 Growing 数据，同时协调 Query Node 查询历史数据。
+
+注意：这里说的是 Milvus 的原生 Collection 检索路径。对于湖原生 External Collection，还需要考虑外部数据集的索引和数据读取路径，不能简单地把所有外部数据都理解成已经加载在 Streaming Node 或 Query Node 的内存中。
+
+#### 第五步：Milvus 在数据湖中定位数据并执行向量检索
+
+这一步是湖原生检索最值得关注的地方。
+
+先看数据湖中可能存在的数据结构：
+
+<img width="1042" height="452" alt="image" src="https://github.com/user-attachments/assets/d5072f32-df53-42a9-80d3-fad9343fdb2b" />
+
+在 Milvus 3.0 的湖原生方案中，可以把整个检索过程理解为以下几个步骤。
+
+① 定位数据集
+
+Milvus 通过外部 Collection 与数据湖中的表建立映射关系。
+
+例如：
+
+```
+Milvus Collection:
+knowledge_base
+
+对应外部数据源:
+s3://company-lake/knowledge/metadata.json
+
+外部格式:
+Iceberg
+
+字段映射:
+id        → doc_id
+embedding → embedding
+title     → title
+content   → content
+```
+
+Milvus 不需要将整份 Iceberg 表重新导入自身数据库。
+
+② 定位索引
+
+Milvus 根据当前数据集版本和索引元信息，定位可用的向量索引。
+
+例如：
+
+```
+Collection
+   ↓
+Manifest
+   ↓
+索引元数据
+   ↓
+HNSW 向量索引
+```
+
+索引的作用是减少搜索范围，避免每次查询都遍历全部向量。
+
+③ 执行 ANN 向量搜索
+
+假设有 1000 万条向量。
+
+用户的查询向量为：
+
+\[ Q=[q_1,q_2,\ldots,q_{1024}] \]
+
+Milvus 根据向量索引搜索与 Q 最相似的候选向量。
+
+例如使用 COSINE 相似度：
+
+\[ sim(Q,V)=\frac{Q\cdot V}{\|Q\|\|V\|} \]
+
+得到候选结果：
+
+| 文档 ID | 相似度 |
+| ------- | ------ |
+| DOC-001 | 0.96   |
+| DOC-023 | 0.93   |
+| DOC-105 | 0.91   |
+| DOC-209 | 0.88   |
+| DOC-315 | 0.85   |
+
+这里的 ANN 是 Approximate Nearest Neighbor，即近似最近邻搜索。
+
+④ 根据候选 ID 获取业务数据
+
+这一步尤其重要。
+
+向量索引通常首先帮助我们找到候选 ID 和相似度，而业务真正需要的是：
+
+- 文档标题。
+- 文档内容。
+- 文档来源。
+- 创建时间。
+- 业务标签。
+
+因此，Milvus 还需要根据候选 ID 定位对应的业务数据。
+
+这涉及湖原生架构中的一个关键技术：Loon（Storage v3）。
+
+Loon 面向对象存储，使用 ColumnGroups 组织数据，并利用对齐的行 ID 支持更高效的窄范围字段读取。
+
+可以把它理解成：
+
+```
+向量索引
+    ↓
+找到候选记录 ID
+    ↓
+定位对应的行
+    ↓
+读取 title、content、source 等字段
+    ↓
+组合成完整结果
+```
+
+为什么需要 Loon？
+
+因为传统分析型列式数据存储更擅长大范围扫描，但向量搜索经常是先找到少量候选记录，再读取这些记录的具体字段。
+
+如果每次只需要读取 5 条记录，却必须从对象存储中读取大量无关数据，就会产生严重的 I/O 放大。
+
+Loon 通过优化列组织和点读路径，减少这类额外读取开销。
+
+这也是湖原生检索能够兼顾数据湖存储成本和在线检索性能的重要技术环节。 
+
+#### 第六步：多节点结果归并与 TopK 排序
+
+由于数据分布在不同 Shard、Segment 或执行节点中，每个节点只负责自己的一部分数据。
+
+例如：
+
+<img width="1032" height="704" alt="image" src="https://github.com/user-attachments/assets/e0f6af52-0e60-4313-896c-4edfe3278130" />
+
+归并过程可以分成三个层次：
+
+1. Segment 级别：对单个 Segment 的检索结果进行局部处理。
+2. Shard 级别：Streaming Node 汇总本 Shard 的实时数据与历史数据结果。
+3. Proxy 级别：将多个 Shard 的结果合并，完成全局排序和 TopK 截取。
+
+例如，用户只要求返回 5 条记录，那么最终只需要返回全局排名最高的 5 条记录。
+
+Milvus 3.0 还支持将更多排序、聚合和结果处理放入检索引擎内部，减少应用端的额外处理。
+
+#### 第七步：Milvus 将结果返回客户端
+
+最终，Milvus 将结果通过原有的 gRPC 或 REST 请求通道返回客户端。
+
+示例：
+
+```
+[
+  {
+    "id": "DOC-001",
+    "distance": 0.96,
+    "entity": {
+      "title": "量子通信专线建设技术方案",
+      "content": "量子通信专线主要采用...",
+      "source": "技术文档"
+    }
+  },
+  {
+    "id": "DOC-023",
+    "distance": 0.93,
+    "entity": {
+      "title": "量子密钥分发网络研究",
+      "content": "量子密钥分发技术...",
+      "source": "研究报告"
+    }
+  }
+]
+```
+
+客户端拿到数据后，可以继续做：
+
+- 将检索结果交给 Rerank 模型重新排序。
+- 将相关文本片段交给大语言模型。
+- 由大语言模型组织答案。
+- 最终返回带引用来源的智能问答结果。
+
+至此，一次完整的向量检索就结束了。
