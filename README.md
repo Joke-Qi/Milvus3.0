@@ -35,4 +35,44 @@
 
 传统架构通常是：
 <img width="625" height="278" alt="image" src="https://github.com/user-attachments/assets/e1a827e0-0bf4-49c9-a090-a4759adf8211" />
+这种模式的问题：
+
+- 数据湖保存一份原始数据。
+- Milvus 又保存一份向量数据及相关字段。
+- 数据发生变化时，需要考虑两套数据的同步。
+- 数据规模越大，数据复制、存储和维护成本越高。
+
+#### 湖原生向量检索模式
+
+湖原生架构的核心变化是：数据可以留在数据湖中，Milvus 直接面向湖中的数据建立索引并提供检索服务。
+<img width="1236" height="614" alt="image" src="https://github.com/user-attachments/assets/3bf6a1ad-17b9-4283-9a60-7b66faa13bc3" />
+这里有一个关键概念：零拷贝（Zero-copy）。
+
+Milvus 3.0 引入了 External Collections（外部 Collection），可以将数据湖中的 Iceberg、Parquet、Lance、Vortex 等数据集映射为 Milvus Collection。
+
+Milvus 不需要把整份源数据复制到自身的 Collection 中，而是在外部数据集上构建和服务索引。外部 Collection 目前是只读的，数据变化通过刷新外部 Collection 的机制感知。
+
+### 2、客户端向 Milvus 发送一次查询请求，完整经过哪些环节？
+
+我们假设有一个真实的业务场景：
+
+某企业建设了一个 AI 知识库，数据保存在对象存储中，采用 Iceberg 表格式，Milvus 负责向量检索。
+
+用户在客户端输入：
+
+> 帮我查找关于量子通信专线建设的相关技术资料。
+
+客户端通过 Embedding 模型，将这段文字转换成一个 1024 维的向量，然后向 Milvus 发送 Search 请求。
+
+注意：Embedding 模型通常由客户端应用或独立的模型服务负责，不是 Milvus 自动替客户端完成的。
+
+#### 完整请求链路总览
+<img width="1014" height="1260" alt="image" src="https://github.com/user-attachments/assets/817842c5-89cb-4cf1-9ffc-0ac3d6a62555" />
+#### 第一步：客户端发起查询请求
+
+客户端首先完成两个动作：
+
+动作 A：将用户问题转换为向量。
+
+例如：
 
