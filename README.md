@@ -410,5 +410,8 @@ Milvus 3.0 还支持将更多排序、聚合和结果处理放入检索引擎内
 
 湖原生检索通过将高性能向量索引和检索能力直接构建在数据湖之上，减少数据复制和同步环节，实现数据湖中海量非结构化数据的统一检索，为 Vector Lakebase 提供高效、低成本、可扩展的向量检索基础设施。
 
+### 附录：相关技术名词
+
+<img width="1198" height="600" alt="image" src="https://github.com/user-attachments/assets/76b599b0-ec7a-4af3-afe3-dc90efc6040e" />
 
 
